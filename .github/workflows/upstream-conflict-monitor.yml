@@ -1,21 +1,31 @@
 name: upstream-conflict-monitor
 on:
   schedule:
-    - cron: '23 * * * *'  # hourly, offset to dodge GitHub top-of-hour load
+    - cron: '23 * * * *'
   workflow_dispatch:
+
 permissions:
   contents: read
   issues: write
+
+concurrency:
+  group: upstream-conflict-monitor
+  cancel-in-progress: true
+
 jobs:
   check:
     if: github.repository == 'maskshell/graphiti'
     runs-on: ubuntu-latest
+    outputs:
+      status: ${{ steps.detect.outputs.status }}
     steps:
       - uses: actions/checkout@v4
         with:
-          fetch-depth: 0
-      - name: Test PR branch against upstream/main
-        id: test
+          fetch-depth: 1
+      - name: Detect upstream state
+        id: detect
+        env:
+          GH_REPO: ${{ github.repository }}
         run: |
           set -eu
           git remote add upstream https://github.com/getzep/graphiti.git
@@ -24,32 +34,64 @@ jobs:
           UP=$(git rev-parse upstream/main)
           TIP=$(git rev-parse origin/main)
           BASE=$(git merge-base "$UP" "$TIP")
+          echo "up_head=$UP" >> "$GITHUB_OUTPUT"
+          echo "tip_head=$TIP" >> "$GITHUB_OUTPUT"
           if [ "$UP" = "$BASE" ]; then
-            echo "status=contained" >> "$GITHUB_OUTPUT"; exit 0
+            echo "status=contained" >> "$GITHUB_OUTPUT"
+            exit 0
           fi
-          if TREE=$(git merge-tree --write-tree "$TIP" "$UP"); then
-            echo "status=clean-behind" >> "$GITHUB_OUTPUT"; exit 0
-          else
-            echo "status=conflict" >> "$GITHUB_OUTPUT"
-            git merge-tree --write-tree --name-only "$TIP" "$UP" | sed -n '/^CONFLICT/,$p' | head -8 > /tmp/conflicts.txt || true
-            exit 1
+          OUT=$(git merge-tree --write-tree --name-only "$TIP" "$UP" || true)
+          if [ -n "$OUT" ] && ! printf '%s' "$OUT" | grep -q '^CONFLICT'; then
+            echo "status=clean-behind" >> "$GITHUB_OUTPUT"
+            exit 0
           fi
-      - name: Open or update tracking issue
-        if: failure()
+          # Conflict: file list = lines after the tree OID until the first blank line
+          printf '%s\n' "$OUT" | sed -n '2,/^$/p' | sed '/^$/d' > /tmp/conflict_files.txt
+          {
+            echo 'status=conflict'
+            echo "files<<EOF"
+            cat /tmp/conflict_files.txt
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+      - name: Reconcile tracking issue
+        if: always()
         env:
           GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          STATUS: ${{ steps.detect.outputs.status }}
+          UP_HEAD: ${{ steps.detect.outputs.up_head }}
+          FILES: ${{ steps.detect.outputs.files }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
           TITLE: 'ops: upstream/main has conflicts with main (PR #1209)'
+          LABEL: upstream-conflict
         run: |
-          BODY="Hourly check found conflicts between upstream/main and our PR branch.
-          Upstream head: $(git rev-parse upstream/main)
+          set -eu
+          # Idempotent label (repo metadata; absent on fresh forks)
+          gh label create "$LABEL" --color B60205 --description 'upstream conflict tracking' 2>/dev/null || true
+
+          OPEN=$(gh issue list --label "$LABEL" --state open --json number --jq 'map(.number) | min // empty' || true)
+
+          if [ "$STATUS" = conflict ]; then
+            # Fingerprint: upstream head + sorted file set — comment only on change
+            FP=$(printf '%s\n%s' "$UP_HEAD" "$FILES" | sort | shasum -a 256 | cut -c1-16)
+            BODY="cc @${{ github.repository_owner }}
+          Upstream head: \`${UP_HEAD}\`
+          Fingerprint: \`${FP}\`
           Conflicting files:
           \`\`\`
-          $(cat /tmp/conflicts.txt 2>/dev/null || echo 'see run logs')
+          ${FILES:-unparsed — see run log}
           \`\`\`
-          Rebase needed. Run log: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
-          ISSUE=$(gh issue list --search "in:title $TITLE" --state open --json number --jq '.[0].number' || true)
-          if [ -n "$ISSUE" ]; then
-            gh issue comment "$ISSUE" --body "Still conflicting (or new conflicts). $BODY"
-          else
-            gh issue create --title "$TITLE" --body "$BODY"
+          Run: ${RUN_URL}"
+            if [ -z "$OPEN" ]; then
+              gh issue create --title "$TITLE" --body "$BODY" --label "$LABEL"
+            else
+              # Respect manual close: only the OPEN labeled issue is touched
+              LAST_FP=$(gh issue view "$OPEN" --json body --jq '.body' | grep -o 'Fingerprint: `[^`]*`' | tail -1 | cut -d'`' -f2 || true)
+              if [ "$LAST_FP" != "$FP" ]; then
+                gh issue comment "$OPEN" --body "$BODY"
+              fi
+            fi
+          elif [ -n "$OPEN" ]; then
+            # conflict -> contained/clean-behind: close with resolution
+            gh issue close "$OPEN" --comment "Resolved: status=${STATUS} at ${RUN_URL}"
           fi
