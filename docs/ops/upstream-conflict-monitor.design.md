@@ -1,73 +1,72 @@
 # Design — upstream conflict monitor (GitHub Actions)
 
-Status: draft for adversarial review (solidforge pipeline: bc -> csr -> pd).
+Status: converged v2 (bc → csr same-family + different-family → pd). Supersedes v1.
 
 ## Problem
 
-PR #1209 lives on fork branch `main`. Upstream `getzep/graphiti` moves actively (3 merges in 2 days at time of writing). Every upstream advance risks (a) GitHub's "out-of-date" flag and (b) real conflicts. The contributor needs timely notification of conflicts without watching the PR page, including when no local machine is online.
+PR #1209 lives on fork branch `main`. Upstream `getzep/graphiti` moves actively. Every advance risks GitHub's out-of-date flag and real conflicts. The owner needs timely conflict notification with no local agent online.
 
 ## Constraints (hard)
 
-1. C1 — Zero PR pollution: no file this automation needs may appear in the PR branch's diff. Fork default branch == PR branch (`main`), and GitHub scheduled workflows run ONLY from the default branch. Therefore the workflow must live on a dedicated branch and the fork's default branch must be switched to it.
-2. C2 — Notification must reach the owner without any local agent: GitHub issue creation on the fork notifies the repo owner by email.
-3. C3 — No secrets: the workflow must operate with the default `GITHUB_TOKEN` only (scope `issues: write`), never a PAT.
-4. C4 — Idempotent alerting: repeated conflict states must update/continue ONE tracking issue, never spam new issues; resolved conflicts must auto-close that issue.
-5. C5 — Must not run on upstream's copy if this branch is ever merged there: guard `if: github.repository == 'maskshell/graphiti'`.
-6. C6 — Known platform limit (disclose, not solve): GitHub deactivates scheduled workflows after 60 days of repo inactivity. Any push to the fork re-arms it. The design treats >60-day total silence as out of scope.
+1. C1 — Zero PR pollution: no file may appear in the PR branch diff. The workflow lives on `ops/monitor`; the fork default branch is switched to it (scheduled workflows run only from the default branch).
+2. C2 — Notification reaches the owner setting-independently: the issue body @mentions the owner (`cc @maskshell`). Per GitHub notification docs, auto-watch excludes forks and email delivery is user-configurable, so bare issue creation is NOT a reliable channel; @mention notification is.
+3. C3 — No secrets: default `GITHUB_TOKEN`, scope `issues: write` (+ `contents: read`), `GH_REPO` set explicitly on every gh call.
+4. C4 — Idempotent alerting: exactly ONE tracking issue, keyed by a repo-level label `upstream-conflict` (repo metadata, not a git file — C1-safe). Label idempotent-create on each run. Repeated conflict states comment only when the state fingerprint changes. Manual close is respected (see A5).
+5. C5 — Never runs on upstream: `if: github.repository == 'maskshell/graphiti'`.
+6. C6 — Platform limit (corrected per GitHub docs): in a PUBLIC repository, scheduled workflows are automatically disabled when no repository activity occurred in 60 days. Reactivation is documented as `gh workflow enable` (or Actions UI "Enable workflow"), or a commit by a write-permission user that CHANGES the cron schedule. A plain push does NOT re-arm a disabled workflow. Out of scope beyond the run-book step.
+7. C7 — Run serialization: `concurrency: { group: upstream-conflict-monitor, cancel-in-progress: true }` — schedule × dispatch collisions cannot double-create the tracking issue.
 
 ## Requirements
 
-- R1: Hourly check (cron offset from :00 to reduce schedule-slot contention).
-- R2: Three-state classification of (upstream/main vs fork main): `contained` (no action), `clean-behind` (rebase advisable; non-alerting log only), `conflict` (alert).
-- R3: On conflict: create-or-update tracking issue listing conflicting files and both heads; link the Actions run.
-- R4: On transition conflict -> non-conflict: close the tracking issue with a resolution note.
-- R5: Manual `workflow_dispatch` trigger for on-demand runs (also serves as the 60-day re-arm test).
-- R6: Detection must not mutate any branch: `git merge-tree --write-tree` (no worktree side effects), never a real merge/push.
-
-## Detection contract
-
-```
-UP   = rev-parse getzep/graphiti@main          (fetched as remote 'upstream')
-TIP  = rev-parse origin@main                    (the PR branch)
-BASE = merge-base UP TIP
-UP == BASE            -> contained
-merge-tree TIP UP ok  -> clean-behind
-otherwise             -> conflict   (+ file list via --name-only tail)
-```
+- R1: Hourly cron, offset from :00 (GitHub delays/drops runs at high load, notably top-of-hour; a delayed or dropped run is subsumed by the next hourly run and does not change issue state).
+- R2: Four-state classification: `contained`, `clean-behind`, `conflict`, `error` (detection failure). The check step ALWAYS exits 0 and emits `status` + `conflict_files` + heads as outputs; a red run means infrastructure failure ONLY (fetch/gh errors).
+- R3: On `conflict` with no OPEN labeled issue: create it (files, both heads, run link, @mention owner).
+- R4: On non-conflict (`contained`/`clean-behind`) with an open labeled issue: close it with a resolution comment naming the state and run. (This implements the conflict→resolved transition.)
+- R5: `workflow_dispatch` for on-demand runs and deploy verification. It is NOT a re-arm path for a disabled workflow (see C6).
+- R6: Detection never mutates branches: `git merge-tree --write-tree --name-only` between the two fetched heads. Conflict file list = lines after the tree OID up to the first blank line (`sed -n '2,/^$/p'`); v1's `/^CONFLICT/` capture grabbed message lines, not files.
+- R7: Fingerprint-gated comments: comment on the open issue only when (upstream head, conflict file set) changed since the last comment; unchanged conflict = silent success (prevents ~24 comments/day).
 
 ## Alert contract (issue lifecycle)
 
-- Title (fixed, searchable): `ops: upstream/main has conflicts with main (PR #1209)`.
-- Conflict & existing open issue -> comment with new heads + files + run link (dedup by title search).
-- Conflict & no open issue -> create with body above.
-- Non-conflict & open issue -> close with `rebased/resolved at <run>` comment.
-- Non-conflict & no issue -> no-op.
+| State | Open labeled issue | Action |
+|---|---|---|
+| conflict | none | create (R3) |
+| conflict | open, new fingerprint | comment (R7) |
+| conflict | open, same fingerprint | no-op |
+| conflict | closed (manually) | no-op — manual close is respected; owner has seen it |
+| contained / clean-behind | open | close with resolution note (R4) |
+| contained / clean-behind | none/closed | no-op |
+| error | any | no alert-path action; red run is the signal (visible in Actions tab only — see Failure modes) |
 
 ## Failure modes & responses
 
 | Failure | Response |
 |---|---|
-| `git fetch upstream` fails (network) | Job fails loudly (red run) — visible in Actions tab; no false "contained". Absence-of-run is itself a signal. |
-| `gh issue` API fails | Job fails; conflict state re-alerts next hour (acceptable duplicate-free retry). |
-| Schedule deactivated (60-day rule) | R5 dispatch re-arms; disclosure in C6. |
-| Fork Actions disabled | Detectable via absent runs; documented re-enable command in run book. |
-| Default branch changed back by owner | Workflow stops scheduling silently — mitigation: this doc records the dependency; check listed in run book. |
+| fetch upstream fails | check step exits nonzero → red run. No false contained, no bogus issue. NOTE: absence-of-run/red-run has NO push notification channel by design; the owner observes the Actions tab (accepted limitation, per docs notifications go to the cron-syntax modifier only for runs that happen). |
+| gh issue/label API fails | red run; state retried next hour, duplicate-free (label dedup) |
+| schedule delayed/dropped at peak | next hourly run subsumes; no state change |
+| workflow disabled (60-day rule) | re-arm per C6: `gh workflow enable upstream-conflict-monitor.yml` |
+| fork Actions disabled (repo level) | `gh api -X PUT repos/maskshell/graphiti/actions/permissions -F enabled=true -F allowed_actions=all` then workflow-level enable |
+| default branch reverted by owner | schedule stops silently; run book records the dependency |
+| no merge-base (unreachable in practice) | detection step fails red under `set -eu` → surfaces as error, not as false contained |
 
-## Decisions
+## Decisions (delta from v1 review)
 
-- D1: Default-branch switch to `ops/monitor` (vs. repository_dispatch from another repo): keeps everything inside the fork, zero external deps; cost is cosmetic (fork landing page shows ops branch).
-- D2: Issue-as-notification (vs. email/webhook): zero secret, native owner email, durable thread history per C2/C3.
-- D3: `merge-tree` (vs. checkout+merge attempt): R6, no mutation, single-process.
-- D4: `clean-behind` does NOT alert (log only): out-of-date flag is visible on the PR page itself; alerting on it duplicates GitHub's own signal. Conflict is the state needing action.
+- D5: `if: always()` reconciliation step consumes check outputs (W1) — red runs mean infra only.
+- D6: label-based dedup replaces title search (W3).
+- D7: @mention in issue body (W4 / different-source C2 finding).
+- D8: fingerprint-gated comments (W6).
+- D9: respect manual close (W5).
+- D10: inherited upstream scheduled workflows on the fork (CodeQL, stale, intake bots) are disabled at the FORK WORKFLOW LEVEL (UI-equivalent, zero file edits, C1-safe) to keep the Actions signal clean.
+- ODP1: NO (keep D4 — clean-behind closes, never comments). ODP2: KEEP hourly (public-repo scheduled runs are free; detection latency is the only cost). ODP3: NO (CI status reaches the owner via native PR notifications; folding it in couples the monitor to lint flakiness).
 
 ## Run book
 
 - Manual run: `gh workflow run upstream-conflict-monitor.yml --repo maskshell/graphiti`.
-- Re-enable Actions: `gh api -X PUT repos/maskshell/graphiti/actions/permissions -F enabled=true -F allowed_actions=all`.
-- Default branch must remain `ops/monitor` for the schedule to fire.
+- Re-arm after 60-day deactivation: `gh workflow enable upstream-conflict-monitor.yml --repo maskshell/graphiti` (C6).
+- Default branch must remain `ops/monitor`.
+- Disabled inherited schedules: CodeQL Advanced, Issue intake, AI Moderator, Close stale incomplete items (D10).
 
-## Open decision points (for review)
+## Retirement (post-merge)
 
-- ODP1: Should `clean-behind` also comment on the tracking issue (non-closing) so the owner sees drift even without conflicts? Current: no (D4).
-- ODP2: Should the cron be hourly, or 4x daily (reduced Actions minutes)? Current: hourly (matches original ask).
-- ODP3: Should the workflow ALSO verify the PR's CI status (checks green) and include it in the issue body? Current: no (scope creep).
+After PR #1209 merges: revert the fork default branch to `main` (or delete the fork), delete `ops/monitor`, close any open tracking issue. Without this, `git fetch origin main` fails hourly forever.
